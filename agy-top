@@ -1,0 +1,1029 @@
+#!/usr/bin/env python3
+"""
+agy-top: Real-time Terminal UI monitor for Google Antigravity (agy)
+Author: cyberdid
+License: MIT
+"""
+
+import os
+import sys
+import glob
+import time
+import json
+import base64
+import asyncio
+import subprocess
+import threading
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any, Tuple
+
+from rich.text import Text
+from rich.table import Table
+from rich.panel import Panel
+from rich.markup import escape
+
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.widgets import Header, Footer, DataTable, Static, Label, TabbedContent, TabPane
+from textual.reactive import reactive
+from textual.binding import Binding
+
+CSS = """
+Screen {
+    background: #181a1f;
+    color: #abb2bf;
+}
+
+#header-box {
+    dock: top;
+    height: 3;
+    background: #21252b;
+    color: #61afef;
+    padding: 0 1;
+    border-bottom: solid #282c34;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+ContentTab {
+    padding: 0 2;
+    text-style: bold;
+}
+
+/* Dashboard scroll container */
+#dash-scroll {
+    height: 1fr;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+/* Quota cards row in Dashboard */
+#quota-cards-row {
+    height: 14;
+    margin-bottom: 1;
+}
+
+.quota-card {
+    width: 1fr;
+    height: 100%;
+    border: solid #3b4048;
+    background: #1e2227;
+    margin-right: 1;
+    padding: 0 1;
+}
+
+.quota-card:last-child {
+    margin-right: 0;
+}
+
+.card-title-gemini {
+    color: #61afef;
+    text-style: bold;
+    border-bottom: solid #3b4048;
+    padding: 0 0;
+    margin-bottom: 0;
+}
+
+.card-title-claude {
+    color: #c678dd;
+    text-style: bold;
+    border-bottom: solid #3b4048;
+    padding: 0 0;
+    margin-bottom: 0;
+}
+
+.card-title-argon {
+    color: #e5c07b;
+    text-style: bold;
+    border-bottom: solid #3b4048;
+    padding: 0 0;
+    margin-bottom: 0;
+}
+
+.card-content {
+    height: 1fr;
+    overflow-y: hidden;
+}
+
+/* Processes table */
+#procs-container {
+    height: 11;
+    margin-bottom: 1;
+    border: solid #3b4048;
+    background: #1e2227;
+}
+
+#procs-table {
+    height: 1fr;
+}
+
+/* Middle row */
+#middle-row {
+    height: 9;
+    margin-bottom: 1;
+}
+
+#tokens-box {
+    width: 1fr;
+    margin-right: 1;
+    border: solid #3b4048;
+    background: #1e2227;
+}
+
+#recent-box {
+    width: 1fr;
+    border: solid #3b4048;
+    background: #1e2227;
+}
+
+.panel-content {
+    padding: 0 1;
+    height: 1fr;
+}
+
+/* Inspector */
+#inspector-box {
+    height: 6;
+    border: solid #3b4048;
+    background: #1e2227;
+}
+
+#inspector-content {
+    padding: 0 1;
+    height: 1fr;
+    color: #e5c07b;
+    overflow-y: auto;
+}
+
+/* Tab 2: All Models & Quota */
+#tab-models-scroll {
+    height: 1fr;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#full-quota-box {
+    border: solid #3b4048;
+    background: #1e2227;
+    margin-bottom: 1;
+}
+
+#full-quota-content {
+    padding: 1 2;
+}
+
+#all-models-box {
+    border: solid #3b4048;
+    background: #1e2227;
+    height: 20;
+    margin-bottom: 1;
+}
+
+#all-models-table {
+    height: 1fr;
+}
+
+#model-inspector-box {
+    height: 5;
+    border: solid #3b4048;
+    background: #1e2227;
+    margin-bottom: 1;
+}
+
+#model-inspector-content {
+    padding: 0 1;
+    color: #61afef;
+}
+
+/* Tab 3: Activity Log */
+#tab-logs-container {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#logs-box {
+    border: solid #3b4048;
+    background: #1e2227;
+    height: 1fr;
+}
+
+#logs-table {
+    height: 1fr;
+}
+"""
+
+ALL_MODELS_DATA = [
+    {
+        "id": "gemini-4-argon-high",
+        "name": "Gemini 4 Argon (High)",
+        "group": "Gemini 4 Argon",
+        "thinking": "High",
+        "bucket_id": "gemini-argon-wtu-weekly",
+        "description": "Deep reasoning flagship model with separate Argon weekly quota.",
+        "example": "agy --model gemini-4-argon-high -p \"Your prompt\""
+    },
+    {
+        "id": "gemini-4-argon-medium",
+        "name": "Gemini 4 Argon (Medium)",
+        "group": "Gemini 4 Argon",
+        "thinking": "Medium",
+        "bucket_id": "gemini-argon-wtu-weekly",
+        "description": "Balanced Argon reasoning model.",
+        "example": "agy --model gemini-4-argon-medium -p \"Your prompt\""
+    },
+    {
+        "id": "gemini-4-argon-low",
+        "name": "Gemini 4 Argon (Low)",
+        "group": "Gemini 4 Argon",
+        "thinking": "Low",
+        "bucket_id": "gemini-argon-wtu-weekly",
+        "description": "Fast Argon reasoning model.",
+        "example": "agy --model gemini-4-argon-low -p \"Your prompt\""
+    },
+    {
+        "id": "gemini-3.8-flash-high",
+        "name": "Gemini 3.8 Flash (High)",
+        "group": "Gemini Models",
+        "thinking": "High",
+        "bucket_id": "gemini-weekly",
+        "description": "Ultra-fast Gemini with extended reasoning budget.",
+        "example": "agy --model gemini-3.8-flash-high -p \"Your prompt\""
+    },
+    {
+        "id": "gemini-3.8-flash-medium",
+        "name": "Gemini 3.8 Flash (Medium)",
+        "group": "Gemini Models",
+        "thinking": "Medium",
+        "bucket_id": "gemini-weekly",
+        "description": "Standard fast multimodal Gemini model.",
+        "example": "agy --model gemini-3.8-flash-medium -p \"Your prompt\""
+    },
+    {
+        "id": "gemini-3.8-flash-low",
+        "name": "Gemini 3.8 Flash (Low)",
+        "group": "Gemini Models",
+        "thinking": "Low",
+        "bucket_id": "gemini-weekly",
+        "description": "Fastest response with minimal reasoning overhead.",
+        "example": "agy --model gemini-3.8-flash-low -p \"Your prompt\""
+    },
+    {
+        "id": "claude-opus-5-5-high",
+        "name": "Claude Opus 5.5 (High)",
+        "group": "Claude and GPT models",
+        "thinking": "High",
+        "bucket_id": "3p-weekly",
+        "description": "Deepest analysis & architecture design model.",
+        "example": "agy --model claude-opus-5-5-high -p \"Your prompt\""
+    },
+    {
+        "id": "claude-opus-5-5-medium",
+        "name": "Claude Opus 5.5 (Medium)",
+        "group": "Claude and GPT models",
+        "thinking": "Medium",
+        "bucket_id": "3p-weekly",
+        "description": "Claude Opus with balanced reasoning effort.",
+        "example": "agy --model claude-opus-5-5-medium -p \"Your prompt\""
+    },
+    {
+        "id": "claude-opus-5-5-low",
+        "name": "Claude Opus 5.5 (Low)",
+        "group": "Claude and GPT models",
+        "thinking": "Low",
+        "bucket_id": "3p-weekly",
+        "description": "Claude Opus with low reasoning latency.",
+        "example": "agy --model claude-opus-5-5-low -p \"Your prompt\""
+    },
+    {
+        "id": "claude-sonnet-5-5-high",
+        "name": "Claude Sonnet 5.5 (High)",
+        "group": "Claude and GPT models",
+        "thinking": "High",
+        "bucket_id": "3p-weekly",
+        "description": "Premier coding model with maximum thought capacity.",
+        "example": "agy --model claude-sonnet-5-5-high -p \"Your prompt\""
+    },
+    {
+        "id": "claude-sonnet-5-5-medium",
+        "name": "Claude Sonnet 5.5 (Medium)",
+        "group": "Claude and GPT models",
+        "thinking": "Medium",
+        "bucket_id": "3p-weekly",
+        "description": "Standard coding workhorse model.",
+        "example": "agy --model claude-sonnet-5-5-medium -p \"Your prompt\""
+    },
+    {
+        "id": "claude-sonnet-5-5-low",
+        "name": "Claude Sonnet 5.5 (Low)",
+        "group": "Claude and GPT models",
+        "thinking": "Low",
+        "bucket_id": "3p-weekly",
+        "description": "Fast coding responses with low thinking budget.",
+        "example": "agy --model claude-sonnet-5-5-low -p \"Your prompt\""
+    },
+    {
+        "id": "gpt-oss-120b-medium",
+        "name": "GPT-OSS 120B (Medium)",
+        "group": "Claude and GPT models",
+        "thinking": "Medium",
+        "bucket_id": "3p-weekly",
+        "description": "Open-weights 120B model via third-party quota bucket.",
+        "example": "agy --model gpt-oss-120b-medium -p \"Your prompt\""
+    },
+]
+
+
+def get_account_email() -> str:
+    token_path = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+    if not os.path.exists(token_path):
+        return "Unknown"
+    try:
+        with open(token_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        id_token = data.get("id_token", "")
+        if id_token:
+            payload = id_token.split(".")[1]
+            padded = payload + "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+            return claims.get("email", "limblucifer666@gmail.com")
+    except Exception:
+        pass
+    return "limblucifer666@gmail.com"
+
+
+def format_tokens(num: int) -> str:
+    if num >= 1_000_000_000:
+        return f"{num / 1_000_000_000:.2f}B"
+    if num >= 1_000_000:
+        return f"{num / 1_000_000:.2f}M"
+    if num >= 1_000:
+        return f"{num / 1_000:.1f}k"
+    return str(num)
+
+
+def format_relative_reset(iso_reset: str, fraction: float = 1.0) -> str:
+    if fraction >= 0.9999 or not iso_reset:
+        return "Quota available"
+    try:
+        clean = iso_reset.replace("Z", "+00:00")
+        target = datetime.fromisoformat(clean)
+        now = datetime.now(timezone.utc)
+        diff = target - now
+        total_seconds = int(diff.total_seconds())
+        if total_seconds <= 0:
+            return "Quota available"
+        total_hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        return f"Refreshes in {total_hours}h {minutes}m"
+    except Exception:
+        return iso_reset
+
+
+def make_progress_bar(fraction: float, width: int = 20) -> Tuple[str, str]:
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(round(fraction * width))
+    empty = width - filled
+    pct = fraction * 100.0
+    if pct >= 60.0:
+        color = "#98c379"  # Green
+    elif pct >= 30.0:
+        color = "#e5c07b"  # Amber
+    else:
+        color = "#e06c75"  # Coral / Red
+    bar_str = f"[{'█' * filled}{'░' * empty}] {pct:6.2f}%"
+    return bar_str, color
+
+
+class AgyTop(App):
+    CSS = CSS
+    TITLE = "agy-top"
+    BINDINGS = [
+        Binding("q", "quit", "Quit", show=True),
+        Binding("1", "tab_dash", "Dashboard", show=True),
+        Binding("2", "tab_models", "All Models & Quota", show=True),
+        Binding("3", "tab_logs", "Activity Logs", show=True),
+        Binding("m", "toggle_models", "Models (m)", show=False),
+        Binding("r", "refresh_quota", "Refresh Quota", show=True),
+        Binding("p", "toggle_pause", "Pause", show=True),
+        Binding("space", "toggle_pause", "Pause", show=False),
+        Binding("s", "cycle_sort", "Sort Order", show=True),
+    ]
+
+    is_paused = reactive(False)
+    account_email = reactive("Loading...")
+    raw_groups = reactive([])
+    active_processes = reactive([])
+    token_stats = reactive({})
+    recent_turns = reactive([])
+    all_turns_history = reactive([])
+    sort_column = reactive("cpu")
+
+    def __init__(self):
+        super().__init__()
+        self._quota_lock = threading.Lock()
+        self._last_quota_fetch = 0
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="header-box")
+        with TabbedContent(id="tabs"):
+            # TAB 1: DASHBOARD
+            with TabPane("📊 [1] Dashboard", id="tab-dash"):
+                with ScrollableContainer(id="dash-scroll"):
+                    with Horizontal(id="quota-cards-row"):
+                        with Vertical(id="card-gemini", classes="quota-card"):
+                            yield Static("🔷 GEMINI MODELS", classes="card-title-gemini")
+                            yield Static(id="card-gemini-content", classes="card-content")
+
+                        with Vertical(id="card-claude", classes="quota-card"):
+                            yield Static("🟣 CLAUDE AND GPT MODELS", classes="card-title-claude")
+                            yield Static(id="card-claude-content", classes="card-content")
+
+                        with Vertical(id="card-argon", classes="quota-card"):
+                            yield Static("🔶 GEMINI 4 ARGON", classes="card-title-argon")
+                            yield Static(id="card-argon-content", classes="card-content")
+
+                    with Vertical(id="procs-container"):
+                        yield Static("⚡ ACTIVE AGY PROCESSES (Updated every 1s) [s: Sort]", classes="box-title")
+                        table = DataTable(id="procs-table")
+                        table.cursor_type = "row"
+                        table.add_columns("PID", "PPID", "Model", "CPU%", "MEM", "Runtime", "Status", "Prompt / Task")
+                        yield table
+
+                    with Horizontal(id="middle-row"):
+                        with Vertical(id="tokens-box"):
+                            yield Static("📈 TODAY'S TOKENS & SPEED", classes="box-title")
+                            yield Static(id="tokens-content", classes="panel-content")
+                        with Vertical(id="recent-box"):
+                            yield Static("📜 RECENT ACTIVITY LOG", classes="box-title")
+                            yield Static(id="recent-content", classes="panel-content")
+
+                    with Vertical(id="inspector-box"):
+                        yield Static("🔍 PROCESS INSPECTOR (Highlight a row with ↑/↓)", classes="box-title")
+                        yield Static(id="inspector-content")
+
+            # TAB 2: ALL MODELS & DETAILED QUOTA
+            with TabPane("🤖 [2] All Models & Quota", id="tab-models"):
+                with ScrollableContainer(id="tab-models-scroll"):
+                    with Vertical(id="full-quota-box"):
+                        yield Static("📊 OFFICIAL ACCOUNT QUOTA & REFRESH LIMITS", classes="box-title")
+                        yield Static(id="full-quota-content")
+
+                    with Vertical(id="all-models-box"):
+                        yield Static("⚡ ALL 13 AVAILABLE CLI MODELS (Use with --model <id>)", classes="box-title")
+                        m_table = DataTable(id="all-models-table")
+                        m_table.cursor_type = "row"
+                        m_table.add_column("Model ID", key="col_id")
+                        m_table.add_column("Model Name", key="col_name")
+                        m_table.add_column("Quota Group", key="col_group")
+                        m_table.add_column("Thinking", key="col_thinking")
+                        m_table.add_column("Quota Status", key="col_status")
+                        m_table.add_column("CLI Example", key="col_example")
+                        yield m_table
+
+                    with Vertical(id="model-inspector-box"):
+                        yield Static("💡 MODEL SPECS & LAUNCH DETAILS", classes="box-title")
+                        yield Static(id="model-inspector-content")
+
+            # TAB 3: FULL ACTIVITY LOG
+            with TabPane("📜 [3] Activity Logs", id="tab-logs"):
+                with Vertical(id="tab-logs-container"):
+                    with Vertical(id="logs-box"):
+                        yield Static("📜 COMPLETE LLM CALL HISTORY TODAY", classes="box-title")
+                        l_table = DataTable(id="logs-table")
+                        l_table.cursor_type = "row"
+                        l_table.add_columns("Time", "Session / Agent", "In Tokens", "Out Tokens", "Cache Read", "Total")
+                        yield l_table
+
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.account_email = get_account_email()
+        self.update_header()
+        self.init_models_table()
+        # Initial quota fetch in background
+        self.trigger_quota_refresh()
+        # Polling intervals
+        self.set_interval(1.0, self.update_processes)
+        self.set_interval(2.5, self.update_tokens)
+        self.set_interval(30.0, self.trigger_quota_refresh)
+
+    def update_header(self) -> None:
+        header_widget = self.query_one("#header-box", Static)
+        status = "[yellow]PAUSED[/yellow]" if self.is_paused else "[green]LIVE[/green]"
+        procs_count = len(self.active_processes)
+        text = (
+            f"[bold cyan]⚡ agy-top[/bold cyan]  │  "
+            f"Account: [bold white]{self.account_email}[/bold white]  │  "
+            f"Active: [bold green]{procs_count}[/bold green]  │  "
+            f"Status: {status}  │  "
+            f"Sort: [bold yellow]{self.sort_column.upper()}[/bold yellow]  │  "
+            f"Tabs: [bold white][1] Dash[/bold white] [bold white][2] Models[/bold white] [bold white][3] Logs[/bold white]  │  "
+            f"Time: {time.strftime('%H:%M:%S')}"
+        )
+        header_widget.update(text)
+
+    def init_models_table(self) -> None:
+        table = self.query_one("#all-models-table", DataTable)
+        table.clear()
+        for m in ALL_MODELS_DATA:
+            group_styled = (
+                f"[yellow]{m['group']}[/yellow]" if "Argon" in m['group'] else (
+                    f"[magenta]{m['group']}[/magenta]" if "Claude" in m['group'] else f"[cyan]{m['group']}[/cyan]"
+                )
+            )
+            think_styled = (
+                f"[bold green]High[/bold green]" if m['thinking'] == "High" else (
+                    f"[yellow]Medium[/yellow]" if m['thinking'] == "Medium" else f"[dim]Low[/dim]"
+                )
+            )
+            table.add_row(
+                m['id'],
+                m['name'],
+                group_styled,
+                think_styled,
+                "Loading...",
+                m['example'],
+                key=m['id']
+            )
+        self.query_one("#model-inspector-content", Static).update(
+            "[dim]Highlight a model in the table above to view specifications and usage syntax.[/dim]"
+        )
+
+    def trigger_quota_refresh(self) -> None:
+        threading.Thread(target=self._fetch_quota_thread, daemon=True).start()
+
+    def _fetch_quota_thread(self) -> None:
+        with self._quota_lock:
+            try:
+                proc = subprocess.run(
+                    ["agy", "-p", "/usage", "--output-format", "json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15
+                )
+                if proc.returncode == 0:
+                    data = json.loads(proc.stdout)
+                    cmd_data = data.get("command", {}).get("data", {})
+                    groups = cmd_data.get("groups", [])
+                    if groups:
+                        self.call_from_thread(self.set_quota_data, groups)
+                        self._last_quota_fetch = time.time()
+            except Exception:
+                pass
+
+    def set_quota_data(self, groups: List[Dict[str, Any]]) -> None:
+        self.raw_groups = groups
+
+        # Helper map: bucket_id -> {frac, reset, name}
+        bucket_map = {}
+        for g in groups:
+            for b in g.get("buckets", []):
+                bid = b.get("id", "")
+                bucket_map[bid] = b
+
+        # 1. Update Card 1: Gemini Models
+        gemini_lines = [
+            "[dim]Models: Gemini Flash, Gemini Pro[/dim]",
+            ""
+        ]
+        g_w = bucket_map.get("gemini-weekly", {})
+        if g_w:
+            frac = g_w.get("remaining_fraction", 1.0)
+            reset = g_w.get("reset_time", "")
+            bar, col = make_progress_bar(frac, width=17)
+            r_str = format_relative_reset(reset, frac)
+            r_style = "[dim cyan]⏳ " + r_str + "[/dim cyan]" if "Refreshes" in r_str else "[green]✅ " + r_str + "[/green]"
+            gemini_lines.extend([
+                "[bold white]Weekly Limit Remaining[/bold white]",
+                f"[{col}]{bar}[/{col}]",
+                r_style,
+                ""
+            ])
+        g_5h = bucket_map.get("gemini-5h", {})
+        if g_5h:
+            frac = g_5h.get("remaining_fraction", 1.0)
+            reset = g_5h.get("reset_time", "")
+            bar, col = make_progress_bar(frac, width=17)
+            r_str = format_relative_reset(reset, frac)
+            r_style = "[dim cyan]⏳ " + r_str + "[/dim cyan]" if "Refreshes" in r_str else "[green]✅ " + r_str + "[/green]"
+            gemini_lines.extend([
+                "[bold white]Five Hour Limit Remaining[/bold white]",
+                f"[{col}]{bar}[/{col}]",
+                r_style,
+                ""
+            ])
+        gemini_lines.append("[bold cyan]CLI:[/bold cyan] [dim]gemini-3.8-flash-{low,med,high}[/dim]")
+        self.query_one("#card-gemini-content", Static).update("\n".join(gemini_lines))
+
+        # 2. Update Card 2: Claude and GPT Models
+        claude_lines = [
+            "[dim]Models: Claude Opus, Sonnet, GPT-OSS[/dim]",
+            ""
+        ]
+        c_w = bucket_map.get("3p-weekly", {})
+        if c_w:
+            frac = c_w.get("remaining_fraction", 1.0)
+            reset = c_w.get("reset_time", "")
+            bar, col = make_progress_bar(frac, width=17)
+            r_str = format_relative_reset(reset, frac)
+            r_style = "[dim cyan]⏳ " + r_str + "[/dim cyan]" if "Refreshes" in r_str else "[green]✅ " + r_str + "[/green]"
+            claude_lines.extend([
+                "[bold white]Weekly Limit Remaining[/bold white]",
+                f"[{col}]{bar}[/{col}]",
+                r_style,
+                ""
+            ])
+        c_5h = bucket_map.get("3p-5h", {})
+        if c_5h:
+            frac = c_5h.get("remaining_fraction", 1.0)
+            reset = c_5h.get("reset_time", "")
+            bar, col = make_progress_bar(frac, width=17)
+            r_str = format_relative_reset(reset, frac)
+            r_style = "[dim cyan]⏳ " + r_str + "[/dim cyan]" if "Refreshes" in r_str else "[green]✅ " + r_str + "[/green]"
+            claude_lines.extend([
+                "[bold white]Five Hour Limit Remaining[/bold white]",
+                f"[{col}]{bar}[/{col}]",
+                r_style,
+                ""
+            ])
+        claude_lines.append("[bold magenta]CLI:[/bold magenta] [dim]claude-opus/sonnet-5-5-*, gpt-oss[/dim]")
+        self.query_one("#card-claude-content", Static).update("\n".join(claude_lines))
+
+        # 3. Update Card 3: Gemini 4 Argon
+        argon_lines = [
+            "[dim]Separate quota for Argon reasoning[/dim]",
+            ""
+        ]
+        a_w = bucket_map.get("gemini-argon-wtu-weekly", {})
+        if a_w:
+            frac = a_w.get("remaining_fraction", 1.0)
+            reset = a_w.get("reset_time", "")
+            bar, col = make_progress_bar(frac, width=17)
+            r_str = format_relative_reset(reset, frac)
+            r_style = "[dim cyan]⏳ " + r_str + "[/dim cyan]" if "Refreshes" in r_str else "[green]✅ " + r_str + "[/green]"
+            argon_lines.extend([
+                "[bold white]Gemini 4 Argon Weekly Limit[/bold white]",
+                f"[{col}]{bar}[/{col}]",
+                r_style,
+                ""
+            ])
+        argon_lines.extend([
+            "[dim]• High Argon quota for reasoning[/dim]",
+            "[dim]• Smooths demand over 7-day period[/dim]",
+            "",
+            "[bold yellow]CLI:[/bold yellow] [dim]gemini-4-argon-{low,med,high}[/dim]"
+        ])
+        self.query_one("#card-argon-content", Static).update("\n".join(argon_lines))
+
+        # 4. Update Tab 2: Full Detailed Quota View (Matching Screenshot layout)
+        full_lines = [f"[bold white]Account:[/bold white] [cyan]{self.account_email}[/cyan]\n"]
+        for g in groups:
+            g_name = g.get("name", "").upper()
+            desc = g.get("description", "")
+            if "ARGON" in g_name:
+                full_lines.append(f"[bold yellow]{g_name}[/bold yellow]")
+            elif "CLAUDE" in g_name:
+                full_lines.append(f"[bold magenta]{g_name}[/bold magenta]")
+            else:
+                full_lines.append(f"[bold cyan]{g_name}[/bold cyan]")
+            if desc:
+                full_lines.append(f"[dim]{desc}[/dim]\n")
+            else:
+                full_lines.append("")
+
+            for b in g.get("buckets", []):
+                b_name = b.get("name", "")
+                frac = b.get("remaining_fraction", 1.0)
+                reset = b.get("reset_time", "")
+                bar_str, color = make_progress_bar(frac, width=42)
+                r_str = format_relative_reset(reset, frac)
+                r_display = f"[dim cyan]Refreshes in {r_str.replace('Refreshes in ', '')}[/dim cyan]" if "Refreshes" in r_str else "[green]Quota available[/green]"
+                full_lines.append(f"  [bold white]{b_name}[/bold white]")
+                full_lines.append(f"  [{color}]{bar_str}[/{color}]")
+                full_lines.append(f"  {r_display}\n")
+
+        self.query_one("#full-quota-content", Static).update("\n".join(full_lines).strip())
+
+        # 5. Update Models Table with live quota fractions
+        m_table = self.query_one("#all-models-table", DataTable)
+        for m in ALL_MODELS_DATA:
+            bid = m.get("bucket_id", "")
+            b_info = bucket_map.get(bid, {})
+            if b_info:
+                frac = b_info.get("remaining_fraction", 1.0)
+                pct = frac * 100.0
+                status_text = f"{pct:.1f}% Available"
+            else:
+                status_text = "Pool Active"
+            try:
+                m_table.update_cell(m['id'], "col_status", status_text)
+            except Exception:
+                pass
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id == "procs-table":
+            if event.row_key and event.row_key.value:
+                pid_str = event.row_key.value
+                for p in self.active_processes:
+                    if str(p["pid"]) == pid_str:
+                        self.update_inspector(p)
+                        break
+        elif event.data_table.id == "all-models-table":
+            if event.row_key and event.row_key.value:
+                mid = event.row_key.value
+                for m in ALL_MODELS_DATA:
+                    if m["id"] == mid:
+                        details = (
+                            f"[bold white]{escape(m['name'])}[/bold white] │ Group: [cyan]{escape(m['group'])}[/cyan] │ Thinking: [yellow]{escape(m['thinking'])}[/yellow]\n"
+                            f"[dim]{escape(m['description'])}[/dim]\n"
+                            f"[bold green]Launch Command:[/bold green] [white]{escape(m['example'])}[/white]"
+                        )
+                        self.query_one("#model-inspector-content", Static).update(details)
+                        break
+
+    def update_processes(self) -> None:
+        if self.is_paused:
+            return
+
+        procs = []
+        for pid_dir in glob.glob("/proc/[0-9]*"):
+            try:
+                pid = int(os.path.basename(pid_dir))
+                with open(f"{pid_dir}/cmdline", "rb") as f:
+                    cmd_bytes = f.read().split(b"\0")
+                cmd_strs = [c.decode("utf-8", errors="replace") for c in cmd_bytes if c]
+                if not cmd_strs:
+                    continue
+                bin_name = os.path.basename(cmd_strs[0])
+                if "agy" in bin_name and "agy-top" not in cmd_strs[0]:
+                    full_cmd = " ".join(cmd_strs)
+                    # Extract model
+                    model = "-"
+                    if "--model" in cmd_strs:
+                        idx = cmd_strs.index("--model")
+                        if idx + 1 < len(cmd_strs):
+                            model = cmd_strs[idx + 1]
+                    # Extract prompt
+                    prompt = "(interactive)"
+                    if "-p" in cmd_strs:
+                        idx = cmd_strs.index("-p")
+                        if idx + 1 < len(cmd_strs):
+                            prompt = cmd_strs[idx + 1].strip().replace("\n", " ")
+                    elif "--prompt" in cmd_strs:
+                        idx = cmd_strs.index("--prompt")
+                        if idx + 1 < len(cmd_strs):
+                            prompt = cmd_strs[idx + 1].strip().replace("\n", " ")
+                    elif "remote-control" in full_cmd:
+                        prompt = "remote-control daemon"
+                        model = "daemon"
+
+                    # Get ppid and stats from ps
+                    ps_out = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "ppid,%cpu,%mem,rss,etime", "--no-headers"],
+                        capture_output=True, text=True
+                    ).stdout.strip().split()
+
+                    if len(ps_out) >= 5:
+                        ppid = ps_out[0]
+                        cpu = float(ps_out[1])
+                        mem = f"{int(ps_out[3]) // 1024}M"
+                        etime = ps_out[4]
+                    else:
+                        ppid = "-"
+                        cpu = 0.0
+                        mem = "-"
+                        etime = "-"
+
+                    status = "RUNNING" if cpu > 0.5 else ("DAEMON" if "remote" in full_cmd else "IDLE")
+
+                    procs.append({
+                        "pid": pid,
+                        "ppid": ppid,
+                        "model": model,
+                        "cpu": cpu,
+                        "mem": mem,
+                        "etime": etime,
+                        "status": status,
+                        "prompt": prompt,
+                        "full_cmd": full_cmd
+                    })
+            except Exception:
+                pass
+
+        # Sort
+        if self.sort_column == "cpu":
+            procs.sort(key=lambda x: x["cpu"], reverse=True)
+        elif self.sort_column == "mem":
+            procs.sort(key=lambda x: int(x["mem"].replace("M", "") or 0), reverse=True)
+        elif self.sort_column == "pid":
+            procs.sort(key=lambda x: x["pid"])
+        elif self.sort_column == "time":
+            procs.sort(key=lambda x: x["etime"], reverse=True)
+
+        self.active_processes = procs
+        self.update_header()
+
+        # Render DataTable
+        table = self.query_one("#procs-table", DataTable)
+        current_row_key = table.cursor_row
+        table.clear()
+
+        for p in procs:
+            status_styled = f"[green]{p['status']}[/green]" if p['status'] == "RUNNING" else (
+                f"[cyan]{p['status']}[/cyan]" if p['status'] == "IDLE" else f"[dim]{p['status']}[/dim]"
+            )
+            cpu_styled = f"[bold yellow]{p['cpu']}%[/bold yellow]" if p['cpu'] > 5.0 else f"{p['cpu']}%"
+            prompt_raw = p.get('prompt', '')
+            prompt_clean = (prompt_raw[:50] + "...") if len(prompt_raw) > 50 else prompt_raw
+            prompt_short = escape(prompt_clean)
+            model_escaped = escape(str(p.get('model', '-')))
+
+            table.add_row(
+                str(p['pid']),
+                str(p['ppid']),
+                model_escaped,
+                cpu_styled,
+                p['mem'],
+                p['etime'],
+                status_styled,
+                prompt_short,
+                key=str(p['pid'])
+            )
+
+        # Update inspector if row selected
+        if procs:
+            idx = min(current_row_key if current_row_key is not None else 0, len(procs) - 1)
+            sel = procs[idx]
+            self.update_inspector(sel)
+        else:
+            self.query_one("#inspector-content", Static).update("[dim]No active agy processes running currently.[/dim]")
+
+    def update_inspector(self, p: Dict[str, Any]) -> None:
+        ppid = p.get("ppid", "-")
+        parent_cmd = "-"
+        if ppid != "-" and os.path.exists(f"/proc/{ppid}/cmdline"):
+            try:
+                with open(f"/proc/{ppid}/cmdline", "rb") as f:
+                    parent_cmd = f.read().replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+
+        safe_parent = escape(parent_cmd[:150])
+        safe_model = escape(str(p.get("model", "-")))
+        raw_cmd = p.get("full_cmd", "")
+        # Truncate prompt so large 60k+ prompts don't degrade UI performance
+        if len(raw_cmd) > 1500:
+            safe_cmd = escape(raw_cmd[:1500]) + " [dim]... (truncated)[/dim]"
+        else:
+            safe_cmd = escape(raw_cmd)
+
+        details = (
+            f"[bold cyan]PID {p['pid']}[/bold cyan] │ Model: [bold green]{safe_model}[/bold green] │ Parent PID: {ppid}\n"
+            f"[bold white]Parent Command:[/bold white] [dim]{safe_parent}[/dim]\n"
+            f"[bold white]Full Command / Prompt:[/bold white] {safe_cmd}"
+        )
+        try:
+            self.query_one("#inspector-content", Static).update(details)
+        except Exception:
+            self.query_one("#inspector-content", Static).update(
+                Text(f"PID {p['pid']} │ Model: {p.get('model', '-')}\nParent: {parent_cmd[:100]}\nCmd: {raw_cmd[:1000]}")
+            )
+
+    def update_tokens(self) -> None:
+        if self.is_paused:
+            return
+
+        now = time.time()
+        day_ago = now - 86400
+        total_in = 0
+        total_out = 0
+        total_cache = 0
+        total_steps = 0
+        recent = []
+        all_logs = []
+
+        transcripts = glob.glob(os.path.expanduser("~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"))
+        for path in transcripts:
+            try:
+                mtime = os.path.getmtime(path)
+                if mtime < day_ago:
+                    continue
+                conv_id = path.split("/brain/")[1].split("/")[0][:8]
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if '"input_tokens"' not in line:
+                            continue
+                        step = json.loads(line)
+                        in_tok = step.get("input_tokens", 0)
+                        out_tok = step.get("output_tokens", 0)
+                        cache_tok = step.get("cache_read_tokens", 0)
+                        total_in += in_tok
+                        total_out += out_tok
+                        total_cache += cache_tok
+                        total_steps += 1
+
+                        created = step.get("created_at", "")
+                        item = {
+                            "time": created,
+                            "conv": conv_id,
+                            "in": in_tok,
+                            "out": out_tok,
+                            "cache": cache_tok,
+                            "total": in_tok + out_tok + cache_tok
+                        }
+                        recent.append(item)
+                        all_logs.append(item)
+            except Exception:
+                pass
+
+        # Sort recent turns
+        recent.sort(key=lambda x: x["time"], reverse=True)
+        self.recent_turns = recent[:5]
+        self.all_turns_history = recent[:50]
+
+        # Calculate cache hit percentage
+        cache_total = total_in + total_cache
+        cache_ratio = (total_cache / cache_total * 100) if cache_total > 0 else 0.0
+
+        # Update Tokens Widget
+        tok_lines = [
+            f"• [bold white]Input Tokens:[/bold white]      {format_tokens(total_in):>10}  ({total_in:,})",
+            f"• [bold white]Output Tokens:[/bold white]     {format_tokens(total_out):>10}  ({total_out:,})",
+            f"• [bold white]Cache Read:[/bold white]        {format_tokens(total_cache):>10}  ({cache_ratio:.1f}% hit ratio)",
+            f"• [bold white]Total LLM Turns:[/bold white]   {total_steps:>10}  steps today",
+            f"• [bold white]Tokens Today:[/bold white]      {format_tokens(total_in + total_out + total_cache):>10}"
+        ]
+        self.query_one("#tokens-content", Static).update("\n".join(tok_lines))
+
+        # Update Recent Turns Widget
+        rec_lines = []
+        for r in self.recent_turns:
+            t_str = r["time"][11:19] if len(r["time"]) >= 19 else r["time"]
+            rec_lines.append(
+                f"[dim]{t_str}[/dim]  [green]In: {format_tokens(r['in'])}[/green]  "
+                f"[cyan]Out: {format_tokens(r['out'])}[/cyan]  "
+                f"[yellow]Cache: {format_tokens(r['cache'])}[/yellow]"
+            )
+        if not rec_lines:
+            rec_lines.append("[dim]No recent model turns recorded today.[/dim]")
+        self.query_one("#recent-content", Static).update("\n".join(rec_lines))
+
+        # Update Tab 3 Logs Table
+        logs_table = self.query_one("#logs-table", DataTable)
+        logs_table.clear()
+        for l in self.all_turns_history:
+            t_str = l["time"].replace("T", " ")[:19]
+            logs_table.add_row(
+                t_str,
+                f"session-{l['conv']}",
+                f"{l['in']:,}",
+                f"{l['out']:,}",
+                f"{l['cache']:,}",
+                f"{l['total']:,}"
+            )
+
+    def action_quit(self) -> None:
+        self.exit()
+
+    def action_tab_dash(self) -> None:
+        self.query_one(TabbedContent).active = "tab-dash"
+
+    def action_tab_models(self) -> None:
+        self.query_one(TabbedContent).active = "tab-models"
+
+    def action_tab_logs(self) -> None:
+        self.query_one(TabbedContent).active = "tab-logs"
+
+    def action_toggle_models(self) -> None:
+        tabs = self.query_one(TabbedContent)
+        if tabs.active == "tab-models":
+            tabs.active = "tab-dash"
+        else:
+            tabs.active = "tab-models"
+
+    def action_refresh_quota(self) -> None:
+        self.query_one("#card-gemini-content", Static).update("[bold yellow]Refreshing official quota...[/bold yellow]")
+        self.query_one("#card-claude-content", Static).update("[bold yellow]Refreshing official quota...[/bold yellow]")
+        self.query_one("#card-argon-content", Static).update("[bold yellow]Refreshing official quota...[/bold yellow]")
+        self.trigger_quota_refresh()
+
+    def action_toggle_pause(self) -> None:
+        self.is_paused = not self.is_paused
+        self.update_header()
+
+    def action_cycle_sort(self) -> None:
+        order = ["cpu", "mem", "time", "pid"]
+        curr_idx = order.index(self.sort_column)
+        self.sort_column = order[(curr_idx + 1) % len(order)]
+        self.update_processes()
+
+
+def main():
+    app = AgyTop()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
